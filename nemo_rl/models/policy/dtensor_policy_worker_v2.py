@@ -35,7 +35,6 @@ from nemo_automodel.components.checkpoint._backports.filesystem import (
 )
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
-    _maybe_adapt_state_dict_from_hf,
     _maybe_adapt_state_dict_to_hf,
 )
 from nemo_automodel.components.checkpoint.checkpointing import (
@@ -48,10 +47,6 @@ from nemo_automodel.components.distributed.cp_utils import (
 )
 from nemo_automodel.components.distributed.fsdp2 import (
     FSDP2Manager,
-)
-from nemo_automodel.components.distributed.grad_utils import (
-    clip_grad_by_total_norm_,
-    get_grad_norm,
 )
 from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
@@ -426,7 +421,10 @@ class DTensorPolicyWorkerV2:
         if init_optimizer:
             optimizer_cls = import_class_from_path(self.cfg["optimizer"]["name"])
             self.optimizer = optimizer_cls(
-                self.model.parameters(), **self.cfg["optimizer"]["kwargs"], exp_avg_dtype=torch.bfloat16, exp_avg_sq_dtype=torch.bfloat16
+                self.model.parameters(),
+                **self.cfg["optimizer"]["kwargs"],
+                exp_avg_dtype=torch.bfloat16,
+                exp_avg_sq_dtype=torch.bfloat16,
             )
         else:
             self.optimizer = None
@@ -834,7 +832,7 @@ class DTensorPolicyWorkerV2:
 
                             # when FSDP reduces the gradients over the DP dim, they're automatically averaged
                             # but we want to sum them so we cancel out the average here
-                            #loss *= self.dp_size * self.cp_size
+                            # loss *= self.dp_size * self.cp_size
                             loss.backward()
 
                     if num_valid_samples > 0:
@@ -843,22 +841,28 @@ class DTensorPolicyWorkerV2:
 
                 grad_norm: Optional[float | torch.Tensor] = None
                 if not eval_mode:
-                    from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+                    from nemo_automodel.components.training.utils import (
+                        scale_grads_and_clip_grad_norm,
+                    )
+
                     grad_norm = scale_grads_and_clip_grad_norm(
-            						self.max_grad_norm,
-            						[self.model],
-            						norm_type=2.0,
-            						pp_enabled=False,
-            						device_mesh=self.device_mesh,
-            						moe_mesh=self.moe_mesh,
-            						ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
-            						pp_axis_name=None,
-            						foreach=True,
-            						num_label_tokens=1,
-            						dp_group_size=self.dp_size*self.cp_size,
-        						)
+                        self.max_grad_norm,
+                        [self.model],
+                        norm_type=2.0,
+                        pp_enabled=False,
+                        device_mesh=self.device_mesh,
+                        moe_mesh=self.moe_mesh,
+                        ep_axis_name="ep"
+                        if self.moe_mesh is not None
+                        and "ep" in self.moe_mesh.mesh_dim_names
+                        else None,
+                        pp_axis_name=None,
+                        foreach=True,
+                        num_label_tokens=1,
+                        dp_group_size=self.dp_size * self.cp_size,
+                    )
                     grad_norm = grad_norm.detach().cpu().float()
-                    '''with torch.no_grad():
+                    """with torch.no_grad():
                         grad_norm = get_grad_norm(
                             self.model.parameters(),
                             dp_cp_group=self.dp_cp_mesh.get_group(),
@@ -871,7 +875,7 @@ class DTensorPolicyWorkerV2:
                                 max_grad_norm=self.max_grad_norm,
                                 total_norm=grad_norm,
                             )
-                        grad_norm = torch.tensor([grad_norm])'''
+                        grad_norm = torch.tensor([grad_norm])"""
 
                     # Update parameters
                     self.optimizer.step()

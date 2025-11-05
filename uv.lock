@@ -36,11 +36,7 @@ requires-dist = ["torch", "packaging", "ninja"]
 
 [[manifest.dependency-metadata]]
 name = "deep-ep"
-<<<<<<< HEAD
 version = "1.2.1+bfded34"
-=======
-version = "1.1.0+e3908bf"
->>>>>>> origin/main
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[manifest.dependency-metadata]]

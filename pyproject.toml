@@ -191,7 +191,15 @@ explicit = true
 
 [tool.uv]
 preview = true  # Enable preview features like extra-build-dependencies
-no-build-isolation-package = ["transformer-engine-torch", "transformer-engine", "flash-attn", "mamba-ssm", "deep_gemm", "deep_ep"]
+no-build-isolation-package = [
+    "transformer-engine-torch",
+    "transformer-engine",
+    "flash-attn",
+    "mamba-ssm",
+    "causal-conv1d",
+    "deep_gemm",
+    "deep_ep"
+]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
 # avoid including these in the default dependency set, but for now it's required.

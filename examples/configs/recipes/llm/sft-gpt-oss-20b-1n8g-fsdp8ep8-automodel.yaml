@@ -201,7 +201,7 @@ logger:
   swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
-    project: "hemild-rl-automodel"
+    project: "sft-dev"
     name: "${policy.model_name}-${data.dataset_name}-attn-${policy.automodel_model_kwargs.backend.attn}-ep${policy.dtensor_cfg.expert_parallel_size}"
   tensorboard:
     log_dir: "tb_logs-sft-dev-${data.dataset_name}"

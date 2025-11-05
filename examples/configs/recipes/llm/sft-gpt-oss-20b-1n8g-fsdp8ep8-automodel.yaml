@@ -24,5 +24,5 @@ policy:
     kwargs:
       store_param_remainders: true
       master_weights: true
-      exp_avg_dtype: torch.bfloat16
-      exp_avg_sq_dtype: torch.bfloat16
+      exp_avg_dtype: bfloat16
+      exp_avg_sq_dtype: bfloat16

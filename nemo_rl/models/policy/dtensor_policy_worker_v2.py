@@ -101,6 +101,13 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
+STRING_TO_DTYPE = {
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+}
+
+
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
 )  # pragma: no cover
@@ -161,13 +168,9 @@ class DTensorPolicyWorkerV2:
         self.cpu_offload = self.cfg["dtensor_cfg"]["cpu_offload"]
         self.max_grad_norm = self.cfg["max_grad_norm"]
 
-        if self.cfg["precision"] == "float32":
-            self.dtype = torch.float32
-        elif self.cfg["precision"] == "bfloat16":
-            self.dtype = torch.bfloat16
-        elif self.cfg["precision"] == "float16":
-            self.dtype = torch.float16
-        else:
+        try:
+            self.dtype = STRING_TO_DTYPE[self.cfg["precision"]]
+        except KeyError:
             raise ValueError(f"Unknown precision: {self.cfg['precision']}")
 
         self.enable_seq_packing = self.cfg["sequence_packing"]["enabled"]
@@ -2140,6 +2143,8 @@ def _resolve_kwargs(callable: Callable, kwargs: dict[str, Any]) -> dict[str, Any
 
     def _resolve_import_class(name: str) -> Any | None:
         try:
+            if name in STRING_TO_DTYPE:
+                return STRING_TO_DTYPE[name]
             return import_class_from_path(name)
         except Exception:
             return

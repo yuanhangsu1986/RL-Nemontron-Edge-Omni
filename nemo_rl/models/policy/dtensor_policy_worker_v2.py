@@ -18,7 +18,8 @@ import os
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Generator, Optional, cast
+from typing import Any, Callable, Generator, Optional, cast
+import inspect
 
 import ray
 import torch
@@ -256,6 +257,7 @@ class DTensorPolicyWorkerV2:
                 **backend_kwargs,
             )
             automodel_model_kwargs["backend"] = backend
+            automodel_model_kwargs["use_liger_kernel"] = False
 
         with init_empty_weights():
             # NeMoAutoModelForCausalLM uses flash_attention_2 by default
@@ -420,11 +422,12 @@ class DTensorPolicyWorkerV2:
 
         if init_optimizer:
             optimizer_cls = import_class_from_path(self.cfg["optimizer"]["name"])
+            optimizer_kwargs = _resolve_kwargs(
+                optimizer_cls, self.cfg["optimizer"]["kwargs"]
+            )
             self.optimizer = optimizer_cls(
                 self.model.parameters(),
-                **self.cfg["optimizer"]["kwargs"],
-                exp_avg_dtype=torch.bfloat16,
-                exp_avg_sq_dtype=torch.bfloat16,
+                **optimizer_kwargs,
             )
         else:
             self.optimizer = None
@@ -862,20 +865,6 @@ class DTensorPolicyWorkerV2:
                         dp_group_size=self.dp_size * self.cp_size,
                     )
                     grad_norm = grad_norm.detach().cpu().float()
-                    """with torch.no_grad():
-                        grad_norm = get_grad_norm(
-                            self.model.parameters(),
-                            dp_cp_group=self.dp_cp_mesh.get_group(),
-                            tp_group=self.tp_mesh.get_group(),
-                            dtype=torch.float32,
-                        )
-                        if self.max_grad_norm is not None:
-                            clip_grad_by_total_norm_(
-                                self.model.parameters(),
-                                max_grad_norm=self.max_grad_norm,
-                                total_norm=grad_norm,
-                            )
-                        grad_norm = torch.tensor([grad_norm])"""
 
                     # Update parameters
                     self.optimizer.step()
@@ -1128,7 +1117,6 @@ class DTensorPolicyWorkerV2:
                         assert token_logprobs.shape[1] == seq_len - 1
                     else:
                         if isinstance(logits, DTensor):
-                            print(f"{logits.__class__=}")
                             token_logprobs = get_logprobs_from_vocab_parallel_logits(
                                 logits,
                                 input_ids,
@@ -2137,3 +2125,37 @@ def _infer_checkpoint_root(weights_path: str) -> str:
     if weights_dir.endswith("weights"):
         return os.path.dirname(weights_dir)
     return weights_dir
+
+
+def _resolve_kwargs(callable: Callable, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Resolve kwargs for a callable.
+
+    Args:
+        callable: The callable to resolve kwargs for
+        kwargs: The kwargs to resolve
+
+    Returns:
+        The resolved kwargs
+    """
+
+    def _resolve_import_class(name: str) -> Any | None:
+        try:
+            return import_class_from_path(name)
+        except Exception:
+            return
+
+    signature = (
+        inspect.signature(callable)
+        if inspect.isfunction(callable)
+        else inspect.signature(callable.__init__)
+    )
+    result = {}
+    for k, v in kwargs.items():
+        if k in signature.parameters:
+            _maybe_resolved_value = (
+                _resolve_import_class(v) if isinstance(v, str) else v
+            )
+            result[k] = (
+                _maybe_resolved_value if _maybe_resolved_value is not None else v
+            )
+    return result

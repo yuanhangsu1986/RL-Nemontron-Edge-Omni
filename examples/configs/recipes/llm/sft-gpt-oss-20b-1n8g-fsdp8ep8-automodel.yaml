@@ -6,7 +6,6 @@ policy:
   max_total_sequence_length: 512
   dequantize_base_checkpoint: true
   automodel_model_kwargs:
-    use_liger_kernel: false
     backend:
       _target_: nemo_automodel.components.moe.utils.BackendConfig
       attn: te

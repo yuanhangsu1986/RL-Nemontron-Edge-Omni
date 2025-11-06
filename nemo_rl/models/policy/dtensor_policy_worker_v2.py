@@ -153,8 +153,10 @@ class DTensorPolicyWorkerV2:
         configure_dynamo_cache()
 
         self.cfg = config
+        self.cpu_offload = self.cfg["dtensor_cfg"]["cpu_offload"]
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
-        torch.distributed.init_process_group(backend="nccl")
+        backend = "nccl" if not self.cpu_offload else "cuda:nccl,cpu:gloo"
+        torch.distributed.init_process_group(backend=backend)
         self.rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
         model_name = self.cfg["model_name"]
@@ -164,7 +166,6 @@ class DTensorPolicyWorkerV2:
         self.checkpointer = None
         self.checkpoint_config = None
 
-        self.cpu_offload = self.cfg["dtensor_cfg"]["cpu_offload"]
         self.max_grad_norm = self.cfg["max_grad_norm"]
 
         try:
@@ -259,16 +260,18 @@ class DTensorPolicyWorkerV2:
                 **backend_kwargs,
             )
             automodel_model_kwargs["backend"] = backend
-            automodel_model_kwargs["use_liger_kernel"] = False
 
         with init_empty_weights():
             # NeMoAutoModelForCausalLM uses flash_attention_2 by default
             # so we need to set it to None if sequence packing is disabled
             # https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
-            self.model = model_class.from_config(
-                model_config,
+            self.model = model_class.from_pretrained(
+                model_name,
                 attn_implementation=attn_impl,
                 torch_dtype=str(model_config.torch_dtype),
+                trust_remote_code=True,
+                config=model_config,
+                use_liger_kernel=False,
                 **automodel_model_kwargs,
             )
 
@@ -338,6 +341,7 @@ class DTensorPolicyWorkerV2:
             activation_checkpointing=self.cfg["dtensor_cfg"][
                 "activation_checkpointing"
             ],
+            custom_tp_plan=self.cfg["dtensor_cfg"].get("custom_parallel_plan", None),
         )
 
         # Store mesh references for downstream usage

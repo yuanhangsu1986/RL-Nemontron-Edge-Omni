@@ -28,9 +28,6 @@ from accelerate import init_empty_weights
 from nemo_automodel import (
     NeMoAutoModelForSequenceClassification,
 )
-from nemo_automodel._transformers.utils import (
-    sliding_window_overwrite,
-)
 from nemo_automodel.components.checkpoint._backports.filesystem import (
     SerializationFormat,
 )
@@ -166,6 +163,8 @@ class DTensorPolicyWorkerV2:
         self.checkpointer = None
         self.checkpoint_config = None
 
+        self.cpu_offload = self.cfg["dtensor_cfg"]["cpu_offload"]
+        self.offload_optimizer_for_logprob = self.cfg["offload_optimizer_for_logprob"]
         self.max_grad_norm = self.cfg["max_grad_norm"]
 
         try:
@@ -201,10 +200,9 @@ class DTensorPolicyWorkerV2:
             # Keeping the master weights in lower precision has shown to cause issues with convergence.
             torch_dtype=torch.float32,
             trust_remote_code=True,
-            **sliding_window_overwrite(
-                model_name
-            ),  # due to https://github.com/huggingface/transformers/issues/38002
-            attn_implementation=attn_impl,
+            attn_implementation="flash_attention_2"
+            if self.enable_seq_packing
+            else None,
             **hf_config_overrides,
         )
 
@@ -1711,8 +1709,12 @@ class DTensorPolicyWorkerV2:
         if not hasattr(self, "zmq_socket"):
             self.zmq_context = zmq.Context()
             self.zmq_socket = self.zmq_context.socket(zmq.REQ)
-            self.zmq_socket.setsockopt(zmq.SNDTIMEO, 30000)  # set timeout to 30 seconds
-            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 30000)  # set timeout to 30 seconds
+            self.zmq_socket.setsockopt(
+                zmq.SNDTIMEO, 120000
+            )  # set timeout to 120 seconds
+            self.zmq_socket.setsockopt(
+                zmq.RCVTIMEO, 120000
+            )  # set timeout to 120 seconds
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.bind(self.get_zmq_address())
 
@@ -1806,13 +1808,21 @@ class DTensorPolicyWorkerV2:
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_lp_inference")
     def prepare_for_lp_inference(self) -> None:
+        # onload model to cuda
         if not self.cpu_offload:
             self.move_to_cuda(self.model)
         else:
             self.model = self.move_buffer_to_device(self.model, "cuda")
 
         self.model.eval()
-        self.offload_before_refit()
+
+        # offload optimizer to cpu
+        torch.randn(1).cuda()  # wake up torch allocator
+        if self.optimizer is not None and self.offload_optimizer_for_logprob:
+            self.move_optimizer_to_device("cpu")
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
@@ -1826,15 +1836,13 @@ class DTensorPolicyWorkerV2:
 
         self.model.train()
         # Move optimizer state to CUDA if it exists
+        # colocated generation will always offload optimizer to cuda before refit
         if (
-            hasattr(self, "optimizer")
-            and self.optimizer is not None
+            self.optimizer is not None
             and not self.cpu_offload
+            and (self.offload_optimizer_for_logprob or self.is_generation_colocated)
         ):
-            for state in self.optimizer.state.values():
-                for k, v in state.items():
-                    if isinstance(v, (DTensor, torch.Tensor)):
-                        state[k] = v.to("cuda")
+            self.move_optimizer_to_device("cuda")
 
         torch.cuda.empty_cache()
 
@@ -1843,11 +1851,8 @@ class DTensorPolicyWorkerV2:
     def offload_before_refit(self) -> None:
         """Offload the optimizer to the CPU."""
         torch.randn(1).cuda()  # wake up torch allocator
-        if hasattr(self, "optimizer") and self.optimizer is not None:
-            for state in self.optimizer.state.values():
-                for k, v in state.items():
-                    if isinstance(v, (DTensor, torch.Tensor)):
-                        state[k] = v.to("cpu")
+        if self.optimizer is not None:
+            self.move_optimizer_to_device("cpu")
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -1867,6 +1872,12 @@ class DTensorPolicyWorkerV2:
         print(
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
+
+    def move_optimizer_to_device(self, device: str | torch.device) -> None:
+        for state in self.optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, (DTensor, torch.Tensor)):
+                    state[k] = v.to(device)
 
     def move_to_device(self, model: nn.Module, device: str | torch.device) -> nn.Module:
         model = self.move_buffer_to_device(model, device)

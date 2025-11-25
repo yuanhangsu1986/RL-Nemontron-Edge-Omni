@@ -130,7 +130,6 @@ class BaseVllmGenerationWorker:
             seed: Random seed for initialization
         """
         self.cfg = config
-
         self.model_name = self.cfg["model_name"]
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
@@ -305,6 +304,7 @@ class BaseVllmGenerationWorker:
 
         llm_kwargs = dict(
             model=self.model_name,
+            served_model_name=self.model_name,
             load_format=load_format,
             # Set in nemo_rl.models.generation.configure_generation_config
             skip_tokenizer_init=self.cfg["vllm_cfg"]["skip_tokenizer_init"],

@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import asyncio
+import copy
 import gc
 import threading
+import time
 import uuid
 from typing import Any, AsyncGenerator, Optional, cast
 
@@ -129,6 +131,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
+        from vllm.v1.metrics.loggers import PrometheusStatLogger
 
         # (TODO: zhiyul) Remove this workaround after upgrading vLLM where the compilation_config passing issue is resolved.
         if llm_kwargs.get("compilation_config", None):
@@ -137,7 +140,14 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             )
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
-        self.llm = AsyncLLM.from_engine_args(self.llm_async_engine_args)
+        self.stat_loggers = (
+            [PrometheusStatLogger]
+            if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False)
+            else []
+        )
+        self.llm = AsyncLLM.from_engine_args(
+            self.llm_async_engine_args, stat_loggers=self.stat_loggers
+        )
 
         self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg["vllm_cfg"].get("expose_http_server"):
@@ -145,12 +155,101 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 self._setup_vllm_server()
             )
 
+        # vLLM Metrics Logger
+        # Metrics logger only enabled for per-actor, model-owner only
+        self._vllm_metrics_lock = threading.Lock()
+        if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            self._start_vllm_metrics_logger()
+
+    def _start_vllm_metrics_logger(self) -> None:
+        """Start a background thread that periodically collects vLLM logger metrics.
+
+        Controlled by vllm_metrics_logger_interval (default: 0.5) in vllm_cfg.
+        Runs only on the model-owner actor.
+        """
+        from vllm.v1.metrics.reader import Gauge, get_metrics_snapshot
+
+        assert self.cfg["vllm_cfg"].get("async_engine", False), (
+            "vLLM metrics logger is only supported with async engine enabled"
+        )
+        # Run only on the model-owner actor
+        if not getattr(self, "is_model_owner", False):
+            return
+
+        assert "vllm_metrics_logger_interval" in self.cfg["vllm_cfg"], (
+            "vllm_metrics_logger_interval must be set in vllm_cfg if enable_vllm_metrics_logger is True"
+        )
+        interval_s = self.cfg["vllm_cfg"]["vllm_metrics_logger_interval"]
+        assert interval_s > 0, (
+            f"vllm_metrics_logger_interval must be a positive float, got {interval_s}"
+        )
+
+        # Lazy import inside thread target to avoid import overhead if disabled
+        stop_event = threading.Event()
+        self._vllm_metrics_logger_stop_event = stop_event
+
+        self.inflight_batch_sizes: list[int] = []
+        self.num_pending_samples: list[int] = []
+
+        def _logger_loop():
+            # Delay a little to let engine settle
+            time.sleep(min(2.0, interval_s))
+            while True:
+                try:
+                    for m in get_metrics_snapshot():
+                        if isinstance(m, Gauge):
+                            # Log the vllm inflight batch sizes
+                            if m.name == "vllm:num_requests_running":
+                                with self._vllm_metrics_lock:
+                                    self.inflight_batch_sizes.append(int(m.value))
+                            # Log the vllm pending number of requests in the queue
+                            elif m.name == "vllm:num_requests_waiting":
+                                with self._vllm_metrics_lock:
+                                    self.num_pending_samples.append(int(m.value))
+                except Exception:
+                    print(
+                        "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
+                        flush=True,
+                    )
+                    pass
+                time.sleep(interval_s)
+
+        t = threading.Thread(
+            target=_logger_loop, name="vllm-metrics-logger", daemon=True
+        )
+        t.start()
+        self._vllm_metrics_logger_thread = t
+        print(
+            "📋[vLLM Metric Logger] vLLM metrics logger thread started",
+            flush=True,
+        )
+
+    def get_vllm_logger_metrics(self) -> dict[str, Any]:
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return {}
+
+        with self._vllm_metrics_lock:
+            metric = {
+                "inflight_batch_sizes": copy.deepcopy(self.inflight_batch_sizes),
+                "num_pending_samples": copy.deepcopy(self.num_pending_samples),
+            }
+        return metric
+
+    def clear_vllm_logger_metrics(self) -> None:
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return
+
+        with self._vllm_metrics_lock:
+            self.inflight_batch_sizes = []
+            self.num_pending_samples = []
+
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
 
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
 
+    # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
         from copy import deepcopy
         from logging import Filter as LoggingFilter
@@ -178,7 +277,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         engine_client = self.llm
         model_config = self.llm_async_engine_args.create_model_config()
         base_model_paths = [
-            BaseModelPath(name=model_config.model, model_path=model_config.model)
+            BaseModelPath(
+                name=model_config.served_model_name, model_path=model_config.model
+            ),
+            BaseModelPath(name=model_config.model, model_path=model_config.model),
         ]
 
         openai_serving_models = OpenAIServingModels(
@@ -252,14 +354,19 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                         last_assistant_message_idx = i
                         break
 
-                # If there's no assistant message, we don't have any issues.
                 if last_assistant_message_idx is None:
-                    return res
+                    # If there's no assistant message, we just use the entire thing.
+                    messages_to_last_assistant_message = (
+                        messages_for_replace_prefix_tokens
+                    )
+                else:
+                    # Include the last assistant message itself.
+                    messages_to_last_assistant_message = (
+                        messages_for_replace_prefix_tokens[
+                            : last_assistant_message_idx + 1
+                        ]
+                    )
 
-                # Include the last assistant message itself.
-                messages_to_last_assistant_message = messages_for_replace_prefix_tokens[
-                    : last_assistant_message_idx + 1
-                ]
                 # Call the actual preprocess chat subroutine so we don't miss anything. Whatever they do is whatever we do since we literally do what they do.
                 corresponding_res = await super()._preprocess_chat(
                     request,
@@ -286,7 +393,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 final_prompt_token_ids = _replace_prefix_tokens(
                     tokenizer=tokenizer,
                     model_prefix_token_ids=request.required_prefix_token_ids,
-                    template_prefix_token_ids=request.required_prefix_token_ids,
+                    template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
                 )
 
@@ -376,38 +483,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         class NeMoRLOpenAIServingTokenization(
             NeMoRLOpenAIServingMixin, OpenAIServingTokenization
         ):
-            async def create_tokenize(self, request, raw_request):
-                """Override to handle required_prefix_token_ids for tokenization."""
-                # Call parent's create_tokenize first
-                result = await super().create_tokenize(request, raw_request)
-
-                # If there's an error or no required_prefix_token_ids, return as-is
-                if isinstance(result, ErrorResponse):
-                    return result
-
-                # Only process chat requests (not completion requests)
-                if not hasattr(request, "messages"):
-                    return result
-
-                # Get the template-tokenized tokens from the result
-                template_token_ids = result.tokens
-
-                # Get the tokenizer from the engine client
-                tokenizer = await self.engine_client.get_tokenizer()
-
-                # Apply _replace_prefix_tokens to fix up the tokenization
-                final_token_ids = _replace_prefix_tokens(
-                    tokenizer=tokenizer,
-                    model_prefix_token_ids=request.required_prefix_token_ids,
-                    template_prefix_token_ids=request.required_prefix_token_ids,
-                    template_token_ids=template_token_ids,
-                )
-
-                # Update the result with the corrected tokens
-                result.tokens = final_token_ids
-                result.count = len(final_token_ids)
-
-                return result
+            pass
 
         openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
             engine_client,
@@ -451,6 +527,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
     def _setup_vllm_server(self) -> "tuple[threading.Thread, str, uvicorn.Server]":
         import threading
+        from logging import Filter as LoggingFilter
+        from logging import LogRecord, getLogger
 
         import uvicorn
         from fastapi import FastAPI
@@ -477,6 +555,18 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             port=free_port,
         )
         server = uvicorn.Server(config=config)
+
+        print(
+            "Adding a uvicorn logging filter so that the logs aren't spammed with 200 OK messages. This is to help errors pop up better and filter out noise."
+        )
+
+        class No200Filter(LoggingFilter):
+            def filter(self, record: LogRecord) -> bool:
+                msg = record.getMessage()
+                return not msg.strip().endswith("200")
+
+        uvicorn_logger = getLogger("uvicorn.access")
+        uvicorn_logger.addFilter(No200Filter())
 
         thread = threading.Thread(target=server.run, daemon=True)
         thread.start()

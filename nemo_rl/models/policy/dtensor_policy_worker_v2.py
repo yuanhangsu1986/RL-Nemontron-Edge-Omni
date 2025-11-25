@@ -25,7 +25,7 @@ import ray
 import torch
 import zmq
 from accelerate import init_empty_weights
-from nemo_automodel import (
+from nemo_automodel._transformers.auto_model import (
     NeMoAutoModelForSequenceClassification,
 )
 from nemo_automodel.components.checkpoint._backports.filesystem import (
@@ -868,7 +868,7 @@ class DTensorPolicyWorkerV2:
                         num_label_tokens=1,
                         dp_group_size=self.dp_size * self.cp_size,
                     )
-                    grad_norm = grad_norm.detach().cpu().float()
+                    grad_norm = torch.tensor(grad_norm, device="cpu", dtype=torch.float32)
 
                     # Update parameters
                     self.optimizer.step()

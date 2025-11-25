@@ -868,7 +868,9 @@ class DTensorPolicyWorkerV2:
                         num_label_tokens=1,
                         dp_group_size=self.dp_size * self.cp_size,
                     )
-                    grad_norm = torch.tensor(grad_norm, device="cpu", dtype=torch.float32)
+                    grad_norm = torch.tensor(
+                        grad_norm, device="cpu", dtype=torch.float32
+                    )
 
                     # Update parameters
                     self.optimizer.step()

@@ -184,7 +184,7 @@ class DTensorPolicyWorkerV2:
 
         hf_config_overrides = self.cfg.get("hf_config_overrides", {}) or {}
 
-        # Choose attention implementation consistent with train_ft.py logic
+        # Choose attention implementation on the following basis:
         # - Packed sequence requires FA2 and CP must be 1
         # - CP > 1 requires SDPA
         cp_size_cfg = self.cfg["dtensor_cfg"]["context_parallel_size"]
@@ -273,7 +273,7 @@ class DTensorPolicyWorkerV2:
                 **automodel_model_kwargs,
             )
 
-        # Hold a copy of model state_dict keys before any parallelization (as in train_ft.py)
+        # Hold a copy of model state_dict keys before any parallelization
         self.model_state_dict_keys = list(self.model.state_dict().keys())
 
         if self.model.config.pad_token_id is None:
@@ -1724,9 +1724,7 @@ class DTensorPolicyWorkerV2:
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         state_dict_info = {}
-        state_dict = self.model.state_dict()
-        state_dict = _maybe_adapt_state_dict_to_hf(self.model, state_dict)
-        for name, tensor in state_dict.items():
+        for name, tensor in self.model.state_dict().items():
             # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
             state_dict_info[name] = (tensor.shape, self.dtype)
 
@@ -1752,9 +1750,7 @@ class DTensorPolicyWorkerV2:
 
         def dtensor_params_generator():
             """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
-            state_dict = self.model.state_dict()
-            state_dict = _maybe_adapt_state_dict_to_hf(self.model, state_dict)
-            for name, tensor in state_dict.items():
+            for name, tensor in self.model.state_dict().items():
                 if isinstance(tensor, DTensor):
                     # Convert DTensor to full tensor for streaming
                     full_tensor = tensor.full_tensor()

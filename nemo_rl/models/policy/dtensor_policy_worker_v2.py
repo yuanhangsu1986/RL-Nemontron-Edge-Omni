@@ -1917,6 +1917,7 @@ class DTensorPolicyWorkerV2:
 
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
         """
+        print(f"Saving checkpoint to {weights_path}")
         if checkpointing_cfg is None:
             raise ValueError(
                 "checkpointing_cfg must be provided when saving checkpoint"
@@ -1988,6 +1989,7 @@ class DTensorPolicyWorkerV2:
             config_updates={
                 "model_save_format": model_save_format,
                 "is_peft": is_peft,
+                "dequantize_base_checkpoint": False,  # the saved checkpoint is already dequantized
             },
             checkpoint_root=checkpoint_root,
         )

@@ -21,6 +21,7 @@ from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Optional, cast
 
+import nemo_automodel.components._peft.lora as _lora_mod
 import ray
 import torch
 import zmq
@@ -99,10 +100,10 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
+# TODO: @ruit remove this once the bump Automodel to 2d20e33a19d5e53a271b1403b507475e68ad14dc
 def _patched_init_lora_weights(self, init_method: str):
     if init_method == "xavier":
         nn.init.xavier_normal_(self.lora_A.weight.data)
-        print("Initialized LoRA weights with patched xavier initialization")
     else:
         nn.init.kaiming_uniform_(self.lora_A.weight.data, a=math.sqrt(5))
     self.lora_B.weight.data.zero_()
@@ -243,7 +244,7 @@ class DTensorPolicyWorkerV2:
         self.peft_config = None
         self.lora_enabled = lora_cfg is not None and lora_cfg["enabled"]
         # patch the init_lora_weights method to use the xavier initialization
-        # _lora_mod.LinearLoRA.init_lora_weights = _patched_init_lora_weights
+        _lora_mod.LinearLoRA.init_lora_weights = _patched_init_lora_weights
         if self.lora_enabled:
             # Always use float32 since FSDP requires all parameters to be in the same dtype.
             # autocast should cast the weights to the correct dtype during the forward pass.
@@ -1759,8 +1760,8 @@ class DTensorPolicyWorkerV2:
             else None,
             "lora_weights": lora_weight_names if self.lora_enabled else None,
         }
-
-        return refit_info
+        # Lora have not fully supported in DTensorPolicyWorkerV2 yet, so we only return the weights
+        return refit_info["weights"]
 
     def get_free_memory_bytes(self) -> int:
         """Get the available free memory."""

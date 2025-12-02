@@ -100,7 +100,7 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
-# TODO: @ruit remove this once the bump Automodel to 2d20e33a19d5e53a271b1403b507475e68ad14dc
+# TODO: @ruit remove this once the bump Automodel to 2d20e33a19d5e53a271b1403b507475e68ad14dc (https://github.com/NVIDIA-NeMo/RL/issues/1586)
 def _patched_init_lora_weights(self, init_method: str):
     if init_method == "xavier":
         nn.init.xavier_normal_(self.lora_A.weight.data)
@@ -1717,51 +1717,15 @@ class DTensorPolicyWorkerV2:
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.bind(self.get_zmq_address())
 
-    def _is_lora_weight(self, name: str) -> bool:
-        """Check if a weight is a LoRA weight based on its name.
-
-        LoRA weights typically contain 'lora_A' or 'lora_B' in their names.
-        """
-        return "lora_A" in name or "lora_B" in name
-
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
-        """Prepare state dict metadata for weight refitting and IPC streaming.
-
-        Returns:
-            dict containing:
-                - 'weights': dict mapping weight names to (shape, dtype) tuples
-                - 'lora_enabled': bool indicating if LoRA is enabled
-                - 'lora_config': optional PeftConfig if LoRA is enabled
-                - 'lora_weights': list of LoRA weight names (when LoRA is enabled)
-        """
+        """Prepare state dict metadata for weight refitting and IPC streaming."""
         state_dict_info = {}
-        lora_weight_names = []
+        for name, tensor in self.model.state_dict().items():
+            # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
+            state_dict_info[name] = (tensor.shape, self.dtype)
 
-        # Determine which weights to include based on LoRA status
-        if self.lora_enabled:
-            # Only include LoRA weights when LoRA is enabled
-            for name, tensor in self.model.state_dict().items():
-                if self._is_lora_weight(name):
-                    # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
-                    state_dict_info[name] = (tensor.shape, self.dtype)
-                    lora_weight_names.append(name)
-        else:
-            # Include all weights when LoRA is not enabled
-            for name, tensor in self.model.state_dict().items():
-                # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
-                state_dict_info[name] = (tensor.shape, self.dtype)
-
-        refit_info = {
-            "weights": state_dict_info,
-            "lora_enabled": self.lora_enabled,
-            "lora_config": self.peft_config.to_dict()
-            if self.lora_enabled and self.peft_config
-            else None,
-            "lora_weights": lora_weight_names if self.lora_enabled else None,
-        }
-        # Lora have not fully supported in DTensorPolicyWorkerV2 yet, so we only return the weights
-        return refit_info["weights"]
+        return state_dict_info
 
     def get_free_memory_bytes(self) -> int:
         """Get the available free memory."""
@@ -1773,11 +1737,7 @@ class DTensorPolicyWorkerV2:
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
-        """Stream model weights to peer process via ZMQ IPC socket.
-
-        When LoRA is enabled, only LoRA weights are streamed.
-        When LoRA is disabled, all weights are streamed.
-        """
+        """Stream model weights to peer process via ZMQ IPC socket."""
         self.maybe_init_zmq()
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
@@ -1786,15 +1746,8 @@ class DTensorPolicyWorkerV2:
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
         def dtensor_params_generator():
-            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors.
-
-            Only yields LoRA weights when LoRA is enabled, otherwise yields all weights.
-            """
+            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
             for name, tensor in self.model.state_dict().items():
-                # Skip non-LoRA weights if LoRA is enabled
-                if self.lora_enabled and not self._is_lora_weight(name):
-                    continue
-
                 if isinstance(tensor, DTensor):
                     # Convert DTensor to full tensor for streaming
                     full_tensor = tensor.full_tensor()
@@ -1818,11 +1771,7 @@ class DTensorPolicyWorkerV2:
 
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:
-        """Broadcast the weights for collective communication.
-
-        When LoRA is enabled, only LoRA weights are broadcasted.
-        When LoRA is disabled, all weights are broadcasted.
-        """
+        """Broadcast the weights for collective communication."""
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
             print(
@@ -1840,17 +1789,8 @@ class DTensorPolicyWorkerV2:
         # param_iterator will return (name, tensor), we only need tensor
         dtensor_post_iter_func = lambda x: _dtensor_post_iter_func(x[1], self.dtype)
 
-        # Filter state dict to only include LoRA weights if LoRA is enabled
-        def _filtered_state_dict_iterator():
-            """Iterator that yields only LoRA weights when LoRA is enabled."""
-            for name, tensor in self.model.state_dict().items():
-                # Skip non-LoRA weights if LoRA is enabled
-                if self.lora_enabled and not self._is_lora_weight(name):
-                    continue
-                yield (name, tensor)
-
         packed_broadcast_producer(
-            iterator=_filtered_state_dict_iterator(),
+            iterator=iter(self.model.state_dict().items()),
             group=self.model_update_group,
             src=0,
             post_iter_func=dtensor_post_iter_func,

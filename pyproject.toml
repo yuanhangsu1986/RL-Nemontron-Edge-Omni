@@ -201,6 +201,7 @@ no-build-isolation-package = [
   "causal-conv1d",
   "deep_gemm",
   "deep_ep",
+  "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
 ]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
@@ -232,6 +233,7 @@ transformer-engine = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
+nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
@@ -261,6 +263,12 @@ name = "deep_gemm"
 # This version has to match the version in the commit/rev/tag used
 version = "v2.0.0+7b6b556"
 requires-dist = ["torch", "packaging", "ninja"]
+
+[[tool.uv.dependency-metadata]]
+name = "nv-grouped-gemm"
+# This version has to match the version in the commit/rev/tag used
+version = "1.1.4.post6"
+requires-dist = ["setuptools", "wheel", "torch", "numpy"]
 
 [tool.black]
 line-length = 120
